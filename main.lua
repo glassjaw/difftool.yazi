@@ -3,14 +3,15 @@
 local TITLE = "Difftool"
 
 local DEFAULTS = {
-	-- Tool to use when none is passed with `--tool`; nil lets git decide (`diff.tool`)
+	-- Tool to use when none is passed with `--tool`; nil uses git's `diff.tool`
 	tool = nil,
 	-- Candidates offered by `--pick`
 	tools = { "meld", "vscode", "bc", "vimdiff", "nvimdiff" },
 	-- Tools that can't compare directories; directory pairs fall back to one diff per changed file
 	per_file_tools = { "vscode" },
-	-- Tools that run inside the terminal, so Yazi has to hide its UI while they run
-	terminal_tools = { "vimdiff", "vimdiff1", "vimdiff2", "vimdiff3", "nvimdiff", "emerge" },
+	-- Extra tools that run inside the terminal, so Yazi has to hide its UI while they run.
+	-- git's built-in terminal tools (vimdiff, nvimdiff, emerge, ...) are detected automatically.
+	terminal_tools = {},
 }
 
 local function notify(level, s, ...)
@@ -86,6 +87,50 @@ local function configured_tool()
 	end
 end
 
+-- What git knows about each tool, from `git difftool --tool-help`:
+-- { [name] = { available = bool, gui = bool?, custom = bool } }, or nil if the output can't be parsed
+local function tool_info()
+	local output = Command("git"):arg({ "difftool", "--tool-help" }):env("LC_ALL", "C"):output()
+	if not output or not output.status.success then
+		return nil
+	end
+
+	local tools, section = {}, nil
+	for line in output.stdout:gmatch("[^\n]+") do
+		if line:find("may be set to one of the following:", 1, true) then
+			section = "available"
+		elseif line:find("valid, but not currently available:", 1, true) then
+			section = "unavailable"
+		elseif line:find("^%S") then
+			section = nil
+		elseif section then
+			local name, desc = line:match("^%s+(%S+)%s+(.*)$")
+			if name and name:find("%.cmd$") then
+				tools[name:sub(1, -5)] = { available = true, custom = true }
+			elseif name then
+				local gui = desc:find("graphical session", 1, true) ~= nil
+				tools[name] = { available = section == "available", gui = gui, custom = false }
+			end
+		end
+	end
+	return next(tools) and tools or nil
+end
+
+-- Returns an error message if git can't launch `tool`
+local function check_tool(tool, info)
+	if not info then
+		return nil -- couldn't read git's tool list, let git report any problem itself
+	elseif not info[tool] then
+		return string.format("git doesn't know a difftool called '%s' (see `git difftool --tool-help`)", tool)
+	elseif not info[tool].available then
+		return string.format(
+			"'%s' isn't installed or isn't on PATH. Set its location with:\ngit config --global difftool.%s.path <path>",
+			tool,
+			tool
+		)
+	end
+end
+
 local function pick_tool(tools)
 	local cands = {}
 	for i, t in ipairs(tools) do
@@ -95,26 +140,25 @@ local function pick_tool(tools)
 	return idx and tools[idx]
 end
 
-local function build_command(tool, a, b, per_file)
-	local cmd
+-- Returns the git arguments and environment that open `tool` on `a` and `b`
+local function git_invocation(tool, a, b, per_file)
+	local envs = { GIT_DIFFTOOL_NO_PROMPT = "true" }
 	if per_file then
-		cmd = Command("git"):arg { "difftool", "--no-index", "--no-prompt" }
-		if tool then
-			cmd = cmd:arg("--tool=" .. tool)
-		end
-		cmd = cmd:arg { "--", a, b }
-	else
-		-- git's own launcher for `difftool --dir-diff`: opens the tool once on two paths,
-		-- honouring diff.tool, difftool.<tool>.path/cmd and the built-in tool definitions
-		cmd = Command("git"):arg { "difftool--helper", a, b }:env("GIT_DIFFTOOL_DIRDIFF", "true")
-		if tool then
-			cmd = cmd:env("GIT_DIFF_TOOL", tool)
-		end
+		return { "difftool", "--no-index", "--no-prompt", "--tool=" .. tool, "--", a, b }, envs
 	end
-	return cmd:env("GIT_DIFFTOOL_NO_PROMPT", "true")
+	-- git's own launcher for `difftool --dir-diff`: opens the tool once on two paths,
+	-- honouring difftool.<tool>.path/cmd and the built-in tool definitions
+	envs.GIT_DIFFTOOL_DIRDIFF = "true"
+	envs.GIT_DIFF_TOOL = tool
+	return { "difftool--helper", a, b }, envs
 end
 
-local function run_in_terminal(cmd)
+local function run_in_terminal(args, envs)
+	local cmd = Command("git"):arg(args)
+	for k, v in pairs(envs) do
+		cmd = cmd:env(k, v)
+	end
+
 	local permit = ui.hide()
 	local status, err = cmd:stdin(Command.INHERIT):stdout(Command.INHERIT):stderr(Command.INHERIT):status()
 	permit:drop()
@@ -127,18 +171,25 @@ local function run_in_terminal(cmd)
 	end
 end
 
-local function run_detached(cmd)
-	local output, err = cmd:stdin(Command.NULL):stdout(Command.PIPED):stderr(Command.PIPED):output()
-	if not output then
-		return notify("error", "Failed to run git: %s", err)
+-- GUI tools are started fully detached. Yazi kills a plugin's child process when the plugin
+-- lets go of it, and counts one it's still waiting on as an unfinished task (asking to confirm
+-- on quit). So start them through a launcher that backgrounds git and exits at once.
+local function run_detached(args, envs)
+	local cmd
+	if ya.target_family() == "windows" then
+		cmd = Command("cmd"):arg({ "/c", "start", "", "/b", "git" }):arg(args)
+	else
+		cmd = Command("sh"):arg({ "-c", 'nohup "$@" >/dev/null 2>&1 &', "sh", "git" }):arg(args)
 	end
-	local code = output.status.code
-	if code ~= 0 and code ~= 1 then
-		local msg = output.stderr ~= "" and output.stderr or output.stdout
-		notify("error", "Difftool failed (exit %s):\n%s", code, msg:gsub("%s+$", ""))
-	elseif code == 1 and output.stderr:find("%S") then
-		-- difftool--helper reports config problems (e.g. unknown tool) with exit 1
-		notify("error", "%s", output.stderr:gsub("%s+$", ""))
+	for k, v in pairs(envs) do
+		cmd = cmd:env(k, v)
+	end
+
+	local status, err = cmd:stdin(Command.NULL):stdout(Command.NULL):stderr(Command.NULL):status()
+	if not status then
+		notify("error", "Failed to run git: %s", err)
+	elseif not status.success then
+		notify("error", "Failed to start the difftool (exit %s)", status.code)
 	end
 end
 
@@ -178,14 +229,28 @@ return {
 			end
 		end
 		tool = tool or opts.tool or configured_tool()
+		if not tool then
+			return notify(
+				"error",
+				"No difftool configured. Set one with:\ngit config --global diff.tool <tool>\nor pass --tool=<tool>"
+			)
+		end
 
-		local per_file = a.is_dir and tool ~= nil and contains(opts.per_file_tools, tool)
-		local cmd = build_command(tool, a.path, b.path, per_file)
+		local info = tool_info()
+		local problem = check_tool(tool, info)
+		if problem then
+			return notify("error", "%s", problem)
+		end
 
-		if tool and contains(opts.terminal_tools, tool) then
-			run_in_terminal(cmd)
+		local per_file = a.is_dir and contains(opts.per_file_tools, tool)
+		local args, envs = git_invocation(tool, a.path, b.path, per_file)
+
+		local builtin = info and info[tool]
+		local in_terminal = contains(opts.terminal_tools, tool) or (builtin and builtin.gui == false)
+		if in_terminal then
+			run_in_terminal(args, envs)
 		else
-			run_detached(cmd)
+			run_detached(args, envs)
 		end
 	end,
 }
